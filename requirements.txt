@@ -1,0 +1,2 @@
+netCDF4
+rasterio>=1.0a12
