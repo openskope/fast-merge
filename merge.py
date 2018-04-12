@@ -1,118 +1,134 @@
+import os
 import sys
+import argparse
 import math
 from netCDF4 import Dataset
 import numpy as np
 import rasterio
 from rasterio.transform import Affine, rowcol
+from rasterio.crs import CRS
 
 import logging
 log = logging.getLogger('mergeNC4')
 logging.basicConfig(level=logging.WARN)
 
-outfile = '/projects/skope/merge.tif'
-precision=7
+
+def add_local_args(parser):
+
+    parser.add_argument('--output', '-o', metavar='FILE', required=True,
+        help='name of the output file')
+    parser.add_argument('--varname', metavar='VAR', required=True, default='',
+        help='the variable name to merged.')
+    parser.add_argument('inputs', metavar='FILE', nargs='+',
+        help='one or more input files')
+    parser.add_argument('--timedim', '-t', default='Year',
+        help='Name of the temporal dimension (default=Year)')
+    parser.add_argument('--output-format', metavar='FORMAT', default='GTiff', 
+        help='Output file format (default=GTiff)')
+    parser.add_argument('--quiet', '-q', default=False, action='store_true',
+        help='no output')
+    parser.add_argument('--separate', default=False, action='store_true',
+        help='write each band to a separate file')
+
 
 def main():
 
+    parser = argparse.ArgumentParser()
+    add_local_args(parser)
+    args = parser.parse_args()
+
+    # TODO we can probably get rid of this
+    first = rasterio.open(args.inputs[0])
+    
     sources = []
-    for fname in sys.argv[1:]:
-        sources.append(rasterio.open(fname))
-
-    first = sources[0]
-    dtype = first.dtypes[0]
-
-
-    ds = Dataset(sys.argv[1])
-    import pdb; pdb.set_trace()
+    for fname in args.inputs:
+        sources.append(Dataset(fname))
 
     lat, lng = [], []
     for src in sources:
-        left, bottom, right, top = src.bounds
-        lng.extend([left, right])
-        lat.extend([bottom, top])
-        if src.dtypes[0] != sources[0].dtypes[0]:
-            log.error('datasets must have the same type')
-            sys.exit(1)
-        #if src.res != sources[0].res:
-        #    log.error('datasets must have the same resolution')
-        #    sys.exit(1)
-        if src.count != sources[0].count:
-            log.error('datasets must have the number of bands')
-            sys.exit(1)
+        lng.extend(src.variables['longitude'][:].tolist())
+        lat.extend(src.variables['latitude'][:].tolist())
+    lng = list(sorted(set(lng)))
+    lat = list(sorted(set(lat)))
 
     dst_w, dst_s, dst_e, dst_n = min(lng), min(lat), max(lng), max(lat)
+
+    # TODO is this safe?
+    #  creating a set from floats seems dangerous
+    output_width = len(lng)
+    output_height = len(lat)
+    # frequent off-by-one errors
+    #output_width = int(math.ceil((dst_e - dst_w) / first.res[0])+1)
+    #output_height = int(math.ceil((dst_n - dst_s) / first.res[1])+1)
 
     log.debug("Output bounds: %r", (dst_w, dst_s, dst_e, dst_n))
     output_transform = Affine.translation(dst_w, dst_n)
     log.debug("Output transform, before scaling: %r", output_transform)
-    output_transform *= Affine.scale(sources[0].res[0], -sources[0].res[1])
+    output_transform *= Affine.scale(first.res[0], -first.res[1])
+    # TODO the following line is close. check parameter order
+    #output_transform *= Affine.scale(lat[1]-lat[0], lng[1]-lng[0])
     log.debug("Output transform, after scaling: %r", output_transform)
 
-    output_width = int(math.ceil((dst_e - dst_w) / sources[0].res[0]))
-    output_height = int(math.ceil((dst_n - dst_s) / sources[0].res[1]))
+    # Seems close 
+    #output_width = int(math.ceil((dst_e - dst_w) / first.res[0])+1)
+    #output_height = int(math.ceil((dst_n - dst_s) / first.res[1])+1)
+    
 
     # Adjust bounds to fit.
     dst_e, dst_s = output_transform * (output_width, output_height)
     log.debug("Output width: %d, height: %d", output_width, output_height)
     log.debug("Adjusted bounds: %r", (dst_w, dst_s, dst_e, dst_n))
 
-    profile = sources[0].profile
+    profile = first.profile
     profile['driver'] = 'GTiff'
     profile['transform'] = output_transform
     profile['height'] = output_height
     profile['width'] = output_width
+    profile['crs'] = CRS().from_string(sources[0].crs)
 
-    profile['nodata'] = None  # rely on alpha mask
+    profile['nodata'] = first.nodata
 
-    band = np.zeros((profile['height'], profile['width']))
-    with rasterio.open(outfile, 'w', **profile) as dstrast:
-        import pdb; pdb.set_trace()
-        for src in sources:
-            b = src.read(1)
-            off_y, off_x = [int(i) for i in dstrast.index(*src.xy(0,0))]
-            print src.bounds
-            print off_y, b.shape[0], off_x, b.shape[1]
-            band[off_y:off_y+b.shape[0], off_x:off_x+b.shape[1]] = b
-        sys.exit(1)
+    band = np.zeros((profile['height'], profile['width']), 
+                    dtype=first.dtypes[0])
 
-        for idx, dst_window in dstrast.block_windows():
-            left, bottom, right, top = dstrast.window_bounds(dst_window)
-
-            blocksize = dst_window.width
-            dst_rows, dst_cols = (dst_window.height, dst_window.width)
-
-            # initialize array destined for the block
-            dst_count = first.count
-            dst_shape = (dst_count, dst_rows, dst_cols)
-            print dst_shape
-            log.debug("Temp shape: %r", dst_shape)
-            dstarr = np.zeros(dst_shape, dtype=dtype)
-
-            for src in sources:
-               window_start = rowcol(src.transform, left, top, 
-                       op=round, precision=precision)
-               window_stop = rowcol(src.transform, right, bottom, 
-                       op=round, precision=precision)
-               print src.name, window_start, window_stop
-               src_window = tuple(zip(window_start, window_stop))
+    if not args.separate:
+        with rasterio.open(args.output, 'w', **profile) as dstrast:
+            for i in range(dstrast.count):
+                if not args.quiet and i % 10 == 0:
+                    sys.stderr.write('.')
+                for src in sources:
+                    b = src.variables[args.varname][i,:,:]
+                    off_y = src.variables['latitude'][:].max()
+                    off_x = src.variables['longitude'][:].min()
+                    rowcol = dstrast.index(off_x, off_y)
+                    row, col = int(rowcol[0]), int(rowcol[1])
+                    log.debug('upper-left: lat=%3.6f (%d), long=%3.6f (%d)', 
+                              off_y, row, off_x, col)
+                    band[row:row+b.shape[0], col:col+b.shape[1]] = b
+                    dstrast.write(band, i+1)
     
-               temp = np.zeros(dst_shape, dtype=dtype)
-               print src_window
-               temp = src.read(out=temp, window=src_window,
-                       boundless=True, masked=False)
-    
-               # pixels without data yet are available to write
-               write_region = np.logical_and((dstarr[3] == 0), (temp[3] != 0))
-               np.copyto(dstarr, temp, where=write_region)
-    
-               # check if dest has any nodata pixels available
-               if np.count_nonzero(dstarr[3]) == blocksize:
-                   break
-    
-               dstrast.write(dstarr, window=dst_window)
-    
-              
-
-
+    if args.separate:
+        timedim = sources[0].variables[args.timedim]
+        #nodata=sources[0].variables[args.varname].missing_value)
+        profile.update(count=1, blockxsize=256, blockysize=256, tiled='yes')
+        del profile['crs']
+        for i in range(len(timedim)):
+            if not args.quiet and i % 10 == 0:
+                sys.stderr.write('.')
+            filename, ext = os.path.splitext(args.output)
+            output = '%s_%04d%s' % (filename, int(timedim[i]), ext)
+            with rasterio.open(output, 'w', **profile) as dstrast:
+                for src in sources:
+                    b = src.variables[args.varname][i,:,:]
+                    off_y = src.variables['latitude'][:].max()
+                    off_x = src.variables['longitude'][:].min()
+                    rowcol = dstrast.index(off_x, off_y)
+                    row, col = int(rowcol[0]), int(rowcol[1])
+                    log.debug('upper-left: lat=%3.6f (%d), long=%3.6f (%d)', 
+                              off_y, row, off_x, col)
+                    band[row:row+b.shape[0], col:col+b.shape[1]] = b
+                    dstrast.write(band, 1)
+        
+    sys.stderr.write('done\n')
 if __name__ == '__main__':
     main()
